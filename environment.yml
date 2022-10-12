@@ -1,0 +1,6 @@
+name: memory 
+dependencies:
+- python=3
+- pytest
+- numpy
+- tensorflow
