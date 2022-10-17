@@ -1,6 +1,7 @@
 from tensorflow.keras import Model, Sequential
 from tensorflow.keras.layers import Layer, Dense, Lambda
 from tensorflow.keras.losses import Loss
+from tensorflow.keras.metrics import Mean, CategoricalAccuracy
 from tensorflow import (
     random,
     GradientTape,
@@ -11,12 +12,18 @@ from tensorflow import (
     TensorArray,
     function,
     Variable,
+    broadcast_to,
+    float32,
+    transpose,
+    argmax,
+    abs,
+    cast,
 )
 from tensorflow.math import argmax
 
 
 class Encoder(Layer):
-    def __init__(self, sizes: int | list, activation: str):
+    def __init__(self, sizes, activation: str):
         super(Encoder, self).__init__()
         if isinstance(sizes, int):
             sizes = [sizes]
@@ -33,9 +40,7 @@ class Encoder(Layer):
 
 
 class Decoder(Layer):
-    def __init__(
-        self, sizes: int | list, activation: str, classification: bool = False
-    ):
+    def __init__(self, sizes, activation: str, classification: bool = False):
         super(Decoder, self).__init__()
         if isinstance(sizes, int):
             sizes = [sizes]
@@ -63,8 +68,8 @@ class Decoder(Layer):
 class AutoEncoder(Model):
     def __init__(
         self,
-        encoder_sizes: int | list,
-        decoder_sizes: int | list,
+        encoder_sizes,
+        decoder_sizes,
         activation: str = "relu",
     ):
         super(AutoEncoder, self).__init__()
@@ -126,7 +131,7 @@ class MemoryEncoder(Layer):
         )
 
         self._decays = constant(
-            [memory_decay**n for n in range(memory_length)], dtype="float32"
+            [memory_decay ** n for n in range(memory_length)], dtype="float32"
         )
         self._mem_decay = memory_decay
         self._obs_size = observation_size
@@ -158,71 +163,170 @@ class MemoryEncoder(Layer):
         return self._mem_decay
 
 
-@function
-def can_run(memory_encoder, M, X):
-    encoded = memory_encoder.encoder(concat((M, X), axis=-1))
-    return memory_encoder.decoder(concat((encoded, X), axis=-1))
+def run_encoder(me, memory, x):
+    return me.encoder(concat((memory, x), axis=-1))
+
+
+def query_new_memory(
+    me, correct_labels, encoded, mem_size, past_states, unseen_states, loss_fn
+):
+    correct_inputs = concat(
+        (broadcast_to(encoded, (me.memory_length, mem_size)), past_states),
+        axis=-1,
+    )
+    incorrect_inputs = concat(
+        (broadcast_to(encoded, (me.memory_length, mem_size)), unseen_states),
+        axis=-1,
+    )
+    correct_in_preds = me.decoder(correct_inputs)
+    incorrect_in_preds = me.decoder(incorrect_inputs)
+    # correct_labels = broadcast_to(constant([1.0, 0.0]), (me.memory_length, 2))
+    incorrect_labels = broadcast_to(constant([0.0, 1.0]), (me.memory_length, 2))
+    loss = loss_fn(correct_in_preds, correct_labels)
+    loss += loss_fn(incorrect_in_preds, incorrect_labels)
+
+    return (
+        loss,
+        (correct_in_preds, correct_labels),
+        (incorrect_in_preds, incorrect_labels),
+    )
+
+
+@function(jit_compile=True)
+def train_segment(
+    me,
+    X,
+    Xnoise,
+    iterations,
+    past_states,
+    unseen_states,
+    memory,
+    loss_fn,
+    optimizer,
+    loss_metric,
+    accuracy_metric,
+):
+    cumulative_loss = 0.0
+    x_idx = 0
+
+    for i in range(iterations):
+        x = X[x_idx]
+
+        correct_labels = me.decoder(
+            concat(
+                (
+                    broadcast_to(memory, (me.memory_length - 1, me.memory_size)),
+                    past_states[i : i + me.memory_length - 1],
+                ),
+                axis=-1,
+            )
+        )
+        correct_labels = transpose(
+            concat(
+                (
+                    expand_dims(argmax(correct_labels, axis=1), axis=0),
+                    expand_dims(abs(argmax(correct_labels, axis=1) - 1), axis=0),
+                ),
+                axis=0,
+            )
+        )
+        correct_labels = concat(
+            (correct_labels, constant([[1, 0]], dtype="int64")), axis=0
+        )
+        correct_labels = cast(correct_labels, dtype=float32)
+
+        with GradientTape(persistent=True) as tape:
+            # Update memory after generating new memory
+            x = expand_dims(x, axis=0)
+            encoded = run_encoder(me, memory, x)
+
+            loss, correct_outputs, incorrect_outputs = query_new_memory(
+                me,
+                correct_labels,
+                encoded,
+                me.memory_size,
+                past_states[i : i + me.memory_length],
+                unseen_states[i : i + me.memory_length],
+                loss_fn,
+            )
+            memory.assign(encoded)
+
+        loss_metric(loss)
+        accuracy_metric(*correct_outputs)
+        accuracy_metric(*incorrect_outputs)
+
+        gradient = tape.gradient(loss, me.trainable_variables)
+        optimizer.apply_gradients(zip(gradient, me.trainable_variables))
+
+        x_idx += 1
+
+        cumulative_loss += loss
+    return cumulative_loss
 
 
 @function
 def train_episode(
-    me, X, Xnoise, loss_fn, optimizer, memory, past_states, unseen_states
+    me,
+    X,
+    Xnoise,
+    loss_fn,
+    optimizer,
+    memory,
+    x_len,
+    loss_metric=lambda *x, **y: None,
+    accuracy_metric=lambda *x, **y: None,
 ):
-    q_idx = 0
-    x_idx = 0
     cumulative_loss = 0.0
-    # zip not allowed in compiled function
-    for x in X:
-        x = expand_dims(x, axis=0)
-        past_states[q_idx % me.memory_length].assign(x)
-        unseen_states[q_idx % me.memory_length].assign(
-            expand_dims(Xnoise[x_idx], axis=0)
+
+    # The number of iterations to run at a time is limited by GPU registers, XLA compilation
+    # will flatten the loop causing intermediate values to be stored in registers generating
+    # a warning.
+    idx = 0
+    iterations = 8
+    for i in range(x_len // iterations):
+        replay_idx = idx - me.memory_length if idx > me.memory_length else 0
+        replay_end = replay_idx + me.memory_length + iterations
+        current_loss = train_segment(
+            me,
+            X[idx : idx + iterations],
+            Xnoise[idx : idx + iterations],
+            iterations,
+            X[replay_idx:replay_end],
+            Xnoise[replay_idx:replay_end],
+            memory,
+            loss_fn,
+            optimizer,
+            loss_metric,
+            accuracy_metric,
         )
-
-        with GradientTape() as tape:
-            # Update memory after generating new memory
-            encoded = me.encoder(concat((memory, x), axis=-1))
-            memory.assign(encoded)
-
-            loss = 0.0
-            # test the states loaded into memory within the goal memory_length
-            for query in past_states[
-                : q_idx + 1 if q_idx + 1 < me.memory_length else me.memory_length
-            ]:
-                query = expand_dims(query, axis=0)
-                loss += (0.7) * loss_fn(
-                    me.decoder(concat((encoded, query), axis=-1)),
-                    constant([[1.0, 0.0]]),
-                )
-            # test states not seen
-            for query in unseen_states[
-                : q_idx + 1 if q_idx + 1 < me.memory_length else me.memory_length
-            ]:
-                query = expand_dims(query, axis=0)
-                loss += loss_fn(
-                    me.decoder(concat((encoded, query), axis=-1)),
-                    constant([[0.0, 1.0]]),
-                )
-        gradient = tape.gradient(loss, me.trainable_variables)
-        optimizer.apply_gradients(zip(gradient, me.trainable_variables))
-        q_idx += 1
-        x_idx += 1
-
-        cumulative_loss += loss
+        cumulative_loss += current_loss
+        idx += iterations
 
     return cumulative_loss
 
 
 def train_memory(
-    me: MemoryEncoder, X, Xnoise, steps_in_episode: int, loss_fn, optimizer
+    me: MemoryEncoder,
+    X,
+    Xnoise,
+    steps_in_episode: int,
+    loss_fn,
+    optimizer,
+    log_metric_fn=lambda *x, **y: None,
 ):
+    assert (
+        steps_in_episode > me.memory_length
+    ), "less steps in episode then memory length."
+
     memory = Variable(zeros(shape=(1, me.memory_size)), trainable=False)
-    past_states = Variable(zeros(shape=(me.memory_length, me.observation_size)))
-    unseen_states = Variable(zeros(shape=(me.memory_length, me.observation_size)))
+    loss_metric = Mean("train_loss", dtype=float32)
+    accuracy_metric = CategoricalAccuracy("train_accuracy")
 
     losses = []
     sie = steps_in_episode
     for i in range(len(X) // steps_in_episode):
+        reset(me, memory)
+
         loss = train_episode(
             me,
             X[i * sie : (i + 1) * sie],
@@ -230,15 +334,21 @@ def train_memory(
             loss_fn,
             optimizer,
             memory,
-            past_states,
-            unseen_states,
+            sie,
+            loss_metric,
+            accuracy_metric,
         )
-        losses.append(loss)
-        reset(me, memory, past_states, unseen_states)
+        losses.append(loss / sie)
+
+        log_metric_fn(loss_metric, accuracy_metric, episode=i)
+
+        loss_metric.reset_states()
+        accuracy_metric.reset_states()
+
+    print(train_segment.pretty_printed_concrete_signatures())
+    print(train_episode.pretty_printed_concrete_signatures())
     return losses
 
 
-def reset(me, memory, past_states, unseen_states):
+def reset(me, memory):
     memory.assign(zeros(shape=(1, me.memory_size)))
-    past_states.assign(zeros(shape=(me.memory_length, me.observation_size)))
-    unseen_states.assign(zeros(shape=(me.memory_length, me.observation_size)))
