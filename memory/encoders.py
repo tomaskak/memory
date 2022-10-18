@@ -345,8 +345,10 @@ def train_memory(
         loss_metric.reset_states()
         accuracy_metric.reset_states()
 
-    print(train_segment.pretty_printed_concrete_signatures())
-    print(train_episode.pretty_printed_concrete_signatures())
+    compiled_fns = train_segment.experimental_get_tracing_count()
+    compiled_fns += train_segment.experimental_get_tracing_count()
+    print("number of JIT retracings on training functions: {}".format(compiled_fns))
+
     return losses
 
 
