@@ -163,6 +163,139 @@ class MemoryEncoder(Layer):
         return self._mem_decay
 
 
+def multi_loss_query(me, memory, mem_size, next_states, unseen_states, loss_fn):
+    correct_inputs = []
+    incorrect_inputs = []
+    current_mem = memory
+    for i in range(me.memory_length):
+        current_mem = me.encoder(
+            concat((memory, expand_dims(next_states[i], axis=0)), axis=1)
+        )
+
+        if i == 0:
+            memory.assign(current_mem)
+
+        expanded_mem = broadcast_to(current_mem, (1 + i, me.memory_size))
+
+        correct_inputs.append(concat((expanded_mem, next_states[0 : i + 1]), axis=1))
+        incorrect_inputs.append(
+            concat(
+                (
+                    broadcast_to(current_mem, (1 + i, me.memory_size)),
+                    unseen_states[0 : i + 1],
+                ),
+                axis=1,
+            )
+        )
+
+    correct_inputs = concat(correct_inputs, axis=0)
+    incorrect_inputs = concat(incorrect_inputs, axis=0)
+
+    label_len = len(correct_inputs)
+
+    correct_in_preds = me.decoder(correct_inputs)
+    incorrect_in_preds = me.decoder(incorrect_inputs)
+    correct_labels = broadcast_to(constant([1.0, 0.0]), (label_len, 2))
+    incorrect_labels = broadcast_to(constant([0.0, 1.0]), (label_len, 2))
+    loss = loss_fn(correct_in_preds, correct_labels)
+    loss += loss_fn(incorrect_in_preds, incorrect_labels)
+
+    return (
+        loss,
+        (correct_in_preds, correct_labels),
+        (incorrect_in_preds, incorrect_labels),
+    )
+
+
+@function(jit_compile=True)
+def train_multi_loss(
+    me,
+    X,
+    Xnoise,
+    iterations,
+    next_states,
+    unseen_states,
+    memory,
+    loss_fn,
+    optimizer,
+    loss_metric,
+    accuracy_metric,
+):
+    cumulative_loss = 0.0
+
+    for i in range(iterations):
+        with GradientTape(persistent=True) as tape:
+            # Update memory after generating new memory
+
+            loss, correct_outputs, incorrect_outputs = multi_loss_query(
+                me,
+                memory,
+                me.memory_size,
+                next_states[i : i + me.memory_length],
+                unseen_states[i : i + me.memory_length],
+                loss_fn,
+            )
+
+        loss_metric(loss)
+        accuracy_metric(*correct_outputs)
+        accuracy_metric(*incorrect_outputs)
+
+        gradient = tape.gradient(loss, me.trainable_variables)
+        optimizer.apply_gradients(zip(gradient, me.trainable_variables))
+
+        cumulative_loss += loss
+
+    return cumulative_loss
+
+
+@function
+def train_multi_loss_episode(
+    me,
+    X,
+    Xnoise,
+    loss_fn,
+    optimizer,
+    memory,
+    x_len,
+    loss_metric=lambda *x, **y: None,
+    accuracy_metric=lambda *x, **y: None,
+):
+    cumulative_loss = 0.0
+
+    # The number of iterations to run at a time is limited by GPU registers, XLA compilation
+    # will flatten the loop causing intermediate values to be stored in registers generating
+    # a warning.
+    idx = 0
+    iterations = 8
+    for i in range(x_len // iterations):
+        replay_idx = idx - me.memory_length if idx > me.memory_length else 0
+        replay_end = replay_idx + me.memory_length + iterations
+
+        replay_idx = i * iterations
+        replay_end = (i + 1) * iterations + me.memory_length
+
+        if replay_end > x_len:
+            break
+
+        current_loss = train_multi_loss(
+            me,
+            X[idx : idx + iterations],
+            Xnoise[idx : idx + iterations],
+            iterations,
+            X[replay_idx:replay_end],
+            Xnoise[replay_idx:replay_end],
+            memory,
+            loss_fn,
+            optimizer,
+            loss_metric,
+            accuracy_metric,
+        )
+        cumulative_loss += current_loss
+        idx += iterations
+
+    return cumulative_loss
+
+
 def run_encoder(me, memory, x):
     return me.encoder(concat((memory, x), axis=-1))
 
@@ -180,7 +313,6 @@ def query_new_memory(
     )
     correct_in_preds = me.decoder(correct_inputs)
     incorrect_in_preds = me.decoder(incorrect_inputs)
-    # correct_labels = broadcast_to(constant([1.0, 0.0]), (me.memory_length, 2))
     incorrect_labels = broadcast_to(constant([0.0, 1.0]), (me.memory_length, 2))
     loss = loss_fn(correct_in_preds, correct_labels)
     loss += loss_fn(incorrect_in_preds, incorrect_labels)
@@ -212,6 +344,7 @@ def train_segment(
     for i in range(iterations):
         x = X[x_idx]
 
+        # Correct labels come from the output of the decoder when tested with previous forms of memory
         correct_labels = me.decoder(
             concat(
                 (
@@ -327,7 +460,8 @@ def train_memory(
     for i in range(len(X) // steps_in_episode):
         reset(me, memory)
 
-        loss = train_episode(
+        # loss = train_episode(
+        loss = train_multi_loss_episode(
             me,
             X[i * sie : (i + 1) * sie],
             Xnoise[i * sie : (i + 1) * sie],

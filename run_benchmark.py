@@ -61,7 +61,7 @@ def main(data: str, noise: str):
     """
     # starting with one case
     observation_size = 10
-    encoder_sizes = [1200, 1200]
+    encoder_sizes = [600, 600]
     memory_size = 50
     memory_length = 5
     memory_decay = 0.9
