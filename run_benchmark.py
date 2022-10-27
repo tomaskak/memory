@@ -14,10 +14,11 @@ from tensorflow import (
     expand_dims,
     gather,
     function,
+    config,
 )
 from tensorflow.random import normal, uniform
 from tensorflow.keras.optimizers import Adadelta
-from tensorflow.keras.losses import CategoricalCrossentropy
+from tensorflow.keras.losses import CategoricalCrossentropy, Reduction
 from tensorflow.summary import create_file_writer, scalar
 
 from time import time
@@ -59,11 +60,10 @@ def main(data: str, noise: str):
     Benchmark for performance of remembering a number of states produces from random sampling
     i.e. no correlation from which to enhance compression ability.
     """
-    # starting with one case
     observation_size = 10
-    encoder_sizes = [600, 600]
+    encoder_sizes = [800, 800]
     memory_size = 50
-    memory_length = 5
+    memory_length = 10
     memory_decay = 0.9
 
     me = MemoryEncoder(
@@ -74,10 +74,13 @@ def main(data: str, noise: str):
         memory_decay=memory_decay,
     )
 
+    # Uncomment for debugging
+    # config.run_functions_eagerly(True)
+
     learning_rate = 0.001
 
     opt = Adadelta(learning_rate=learning_rate)
-    loss_fn = CategoricalCrossentropy()
+    loss_fn = CategoricalCrossentropy(reduction=Reduction.NONE, axis=1)
 
     data_size = 30 * 1000 * 1000
     steps_in_episode = memory_length * 50
@@ -114,7 +117,7 @@ def main(data: str, noise: str):
                 )
 
         cumulative_losses = train_memory(
-            me, X, Xnoise, steps_in_episode, loss_fn, opt, log_training_result
+            me, X, Xnoise, steps_in_episode, loss_fn, opt, log_training_result, True
         )
 
     if data == "all":

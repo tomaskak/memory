@@ -19,7 +19,9 @@ from tensorflow import (
     abs,
     cast,
 )
-from tensorflow.math import argmax
+from tensorflow.math import argmax, reduce_sum, reduce_mean
+
+from memory.datagen import gen_distance_loss_factors
 
 
 class Encoder(Layer):
@@ -163,7 +165,9 @@ class MemoryEncoder(Layer):
         return self._mem_decay
 
 
-def multi_loss_query(me, memory, mem_size, next_states, unseen_states, loss_fn):
+def multi_loss_query(
+    me, memory, mem_size, next_states, unseen_states, loss_weights, loss_fn
+):
     correct_inputs = []
     incorrect_inputs = []
     current_mem = memory
@@ -178,15 +182,17 @@ def multi_loss_query(me, memory, mem_size, next_states, unseen_states, loss_fn):
         expanded_mem = broadcast_to(current_mem, (1 + i, me.memory_size))
 
         correct_inputs.append(concat((expanded_mem, next_states[0 : i + 1]), axis=1))
-        incorrect_inputs.append(
-            concat(
-                (
-                    broadcast_to(current_mem, (1 + i, me.memory_size)),
-                    unseen_states[0 : i + 1],
-                ),
-                axis=1,
+
+        if i == me.memory_length - 1:
+            incorrect_inputs.append(
+                concat(
+                    (
+                        broadcast_to(current_mem, (1 + i, me.memory_size)),
+                        unseen_states[0 : i + 1],
+                    ),
+                    axis=1,
+                )
             )
-        )
 
     correct_inputs = concat(correct_inputs, axis=0)
     incorrect_inputs = concat(incorrect_inputs, axis=0)
@@ -196,9 +202,14 @@ def multi_loss_query(me, memory, mem_size, next_states, unseen_states, loss_fn):
     correct_in_preds = me.decoder(correct_inputs)
     incorrect_in_preds = me.decoder(incorrect_inputs)
     correct_labels = broadcast_to(constant([1.0, 0.0]), (label_len, 2))
-    incorrect_labels = broadcast_to(constant([0.0, 1.0]), (label_len, 2))
-    loss = loss_fn(correct_in_preds, correct_labels)
-    loss += loss_fn(incorrect_in_preds, incorrect_labels)
+    incorrect_labels = broadcast_to(constant([0.0, 1.0]), (len(incorrect_inputs), 2))
+
+    # There is exactly 3x more tests for seen inputs, this factor makes seen/unseen equally weighted
+    # not counting for distance weights
+    loss = 0.34 * loss_fn(correct_in_preds, correct_labels)
+    loss_add = loss_fn(incorrect_in_preds, incorrect_labels)
+
+    loss = reduce_mean(concat((loss, loss_add), axis=0))
 
     return (
         loss,
@@ -215,6 +226,7 @@ def train_multi_loss(
     iterations,
     next_states,
     unseen_states,
+    loss_weights,
     memory,
     loss_fn,
     optimizer,
@@ -233,6 +245,7 @@ def train_multi_loss(
                 me.memory_size,
                 next_states[i : i + me.memory_length],
                 unseen_states[i : i + me.memory_length],
+                loss_weights[i],
                 loss_fn,
             )
 
@@ -253,6 +266,7 @@ def train_multi_loss_episode(
     me,
     X,
     Xnoise,
+    loss_weights,
     loss_fn,
     optimizer,
     memory,
@@ -268,9 +282,6 @@ def train_multi_loss_episode(
     idx = 0
     iterations = 8
     for i in range(x_len // iterations):
-        replay_idx = idx - me.memory_length if idx > me.memory_length else 0
-        replay_end = replay_idx + me.memory_length + iterations
-
         replay_idx = i * iterations
         replay_end = (i + 1) * iterations + me.memory_length
 
@@ -284,6 +295,7 @@ def train_multi_loss_episode(
             iterations,
             X[replay_idx:replay_end],
             Xnoise[replay_idx:replay_end],
+            loss_weights[i * iterations : (i + 1) * iterations],
             memory,
             loss_fn,
             optimizer,
@@ -446,6 +458,7 @@ def train_memory(
     loss_fn,
     optimizer,
     log_metric_fn=lambda *x, **y: None,
+    multi_loss=False,
 ):
     assert (
         steps_in_episode > me.memory_length
@@ -455,16 +468,23 @@ def train_memory(
     loss_metric = Mean("train_loss", dtype=float32)
     accuracy_metric = CategoricalAccuracy("train_accuracy")
 
+    loss_weights = gen_distance_loss_factors(
+        X, Xnoise, steps_in_episode, me.memory_length
+    )
+
     losses = []
     sie = steps_in_episode
+
+    train_fn = train_multi_loss_episode if multi_loss else train_episode
+
     for i in range(len(X) // steps_in_episode):
         reset(me, memory)
 
-        # loss = train_episode(
-        loss = train_multi_loss_episode(
+        loss = train_fn(
             me,
             X[i * sie : (i + 1) * sie],
             Xnoise[i * sie : (i + 1) * sie],
+            loss_weights[i * sie : (i + 1) * sie],
             loss_fn,
             optimizer,
             memory,
